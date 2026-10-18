@@ -1,0 +1,12 @@
+name: post-cortex
+version: "0.1.0"
+description: "post-cortex self-hosted memory: typed records in an entity graph with semantic search. Workspace recall before each turn, built-in memory mirrored, tools to search, record and trace dependencies."
+author: Julius ML
+license: MIT
+homepage: https://github.com/julymetodiev/hermes-plugin-post-cortex
+tags: [memory, knowledge-graph, self-hosted, semantic-search]
+requires_hermes: ">=0.22.2"
+# The provider's own tools (post_cortex_search, post_cortex_record, post_cortex_context)
+# come from MemoryProvider.get_tool_schemas(), not from register(ctx).
+provides_tools: []
+provides_hooks: []

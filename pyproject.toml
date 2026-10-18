@@ -1,0 +1,14 @@
+[project]
+name = "hermes-plugin-post-cortex"
+version = "0.1.0"
+description = "Hermes Agent memory provider plugin: post-cortex"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+# Standard library only: the plugin talks to the post-cortex daemon over HTTP.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/julymetodiev/hermes-plugin-post-cortex"
+post-cortex = "https://github.com/julymetodiev/post-cortex"
+
