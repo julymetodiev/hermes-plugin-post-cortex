@@ -12,7 +12,12 @@ profile to it:
 - on_memory_write: what the agent saves to its built-in memory is mirrored as a
   record (primary agent only).
 - Tools: post_cortex_search, post_cortex_record, post_cortex_context.
-- No sync_turn: whole turns are noise. Durable knowledge is recorded deliberately.
+- Cards: the user card and the workspace's project card (post-cortex 0.5) are put in
+  the system prompt.
+- sync_turn, only with "capture": true (off by default): each completed turn goes to
+  the profile session's message stream (post-cortex 0.5), kept apart from the records
+  and searched only when asked for (sources: messages). Primary agent only.
+- Records and messages carry the author "hermes:<profile>" (the session name).
 
 Settings: $HERMES_HOME/post-cortex.json. Secrets: PCX_TOKEN (and optionally
 PCX_URL) through the Hermes secret scope.
@@ -33,7 +38,7 @@ from .pcx_client import DEFAULT_URL, PcxClient, PcxError
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.2.0"
 CONFIG_FILE = "post-cortex.json"
 
 INTERACTION_TYPES = ("qa", "decision_made", "problem_solved", "code_change", "requirement_added", "concept_defined")
@@ -52,6 +57,11 @@ DEFAULTS: dict[str, Any] = {
     "timeout_s": 3.0,
     "mirror_memory_writes": True,
     "tools": True,
+    # Put the user card and the workspace's project card in the system prompt.
+    "cards": True,
+    # Send every completed turn to the profile session's message stream (opt-in).
+    "capture": False,
+    "capture_timeout_s": 15.0,
     # Records that carry no knowledge of their own (regexes, matched at the start of the text).
     "skip_patterns": [r"^Modified /", r"^Incremental Update\s*$"],
     # Extra entities for mirrored memory notes: [{"pattern": "<regex>", "entity_type": "<type>"}].
@@ -114,6 +124,43 @@ def extract_entities(text: str, patterns: list[tuple[re.Pattern, str]], limit: i
     return out[:limit]
 
 
+def turn_number(messages: Optional[list[dict]]) -> int:
+    """How many user messages the conversation has, the current one included (0: unknown)."""
+    return sum(1 for m in messages or [] if isinstance(m, dict) and m.get("role") == "user")
+
+
+FILE_ARGS = ("path", "file_path", "filename", "notebook_path")
+
+
+def turn_tools(messages: Optional[list[dict]]) -> tuple[list[str], list[str]]:
+    """Names of the tools called since the last user message, and the file paths in their
+    arguments (OpenAI-style tool_calls)."""
+    tail: list[dict] = []
+    for m in reversed(messages or []):
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "user":
+            break
+        tail.append(m)
+    tools: list[str] = []
+    files: list[str] = []
+    for m in reversed(tail):
+        for call in m.get("tool_calls") or []:
+            fn = (call or {}).get("function") or {}
+            name = fn.get("name")
+            if name and name not in tools:
+                tools.append(name)
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except (TypeError, ValueError):
+                args = {}
+            for k in FILE_ARGS:
+                v = args.get(k) if isinstance(args, dict) else None
+                if isinstance(v, str) and v and v not in files:
+                    files.append(v)
+    return tools, files
+
+
 def _tool_error(message: str) -> str:
     return json.dumps({"error": message[:500]}, ensure_ascii=False)
 
@@ -135,6 +182,8 @@ SEARCH_SCHEMA = {
                                  "description": "Only these record types (session and global scope)."},
             "date_from": {"type": "string", "description": "YYYY-MM-DD lower bound."},
             "date_to": {"type": "string", "description": "YYYY-MM-DD upper bound."},
+            "corpus": {"type": "string", "enum": ["records", "messages", "all"],
+                       "description": "records (default), messages (captured conversation turns) or all."},
         },
         "required": ["query"],
     },
@@ -164,6 +213,9 @@ RECORD_SCHEMA = {
                                "context": {"type": "string", "description": "Why the relation holds."}}},
                 "description": "At least one; both ends must be listed in entities; no self-relations."},
             "code_reference": {"type": "string", "description": "Optional 'path', 'path:line' or 'path:start-end'."},
+            "derived_from": {"type": "array", "items": {"type": "string"},
+                             "description": "Optional: content_ids ('message:<n>') of the captured messages this "
+                                            "record was drawn from, from a corpus=messages search."},
         },
         "required": ["interaction_type", "title", "description", "entities", "relations"],
     },
@@ -199,6 +251,8 @@ class PostCortexMemoryProvider(MemoryProvider):
         self._writes = True
         self._last_count: Optional[int] = None
         self._error = ""
+        self._cards_block = ""
+        self._turns: dict[str, int] = {}
 
     @property
     def name(self) -> str:
@@ -271,6 +325,7 @@ class PostCortexMemoryProvider(MemoryProvider):
                 f"Hermes profile {self._profile}: records written by the agent and mirrored built-in memory")
             self._session_names = {(s.get("id") or s.get("session_id")): s.get("name") or "" for s in client.sessions()}
             self._client = client
+            self._cards_block = self._load_cards() if self._cfg["cards"] else ""
         except (PcxError, OSError, ValueError) as e:
             self._error = str(e)
             self._client = None
@@ -278,6 +333,21 @@ class PostCortexMemoryProvider(MemoryProvider):
 
     def shutdown(self) -> None:
         self._client = None
+
+    def _load_cards(self) -> str:
+        """The user and project cards as a prompt section; "" without cards or on a daemon
+        without the cards API (older than 0.5)."""
+        try:
+            cards = self._client.cards(self._workspace_id)
+        except (PcxError, OSError, ValueError) as e:
+            logger.debug("post-cortex: no cards (%s)", e)
+            return ""
+        parts = []
+        for key, title in (("user", "User card"), ("workspace", f"Project card ({self._workspace})")):
+            text = ((cards.get(key) or {}).get("text") or "").strip()
+            if text:
+                parts.append(f"### {title}\n{text}")
+        return "\n\n".join(parts)
 
     # ---- prompt and recall ---------------------------------------------------------------
 
@@ -292,6 +362,8 @@ class PostCortexMemoryProvider(MemoryProvider):
                       "- `post_cortex_record` for durable knowledge: decisions and why, root causes with evidence, "
                       "fixes that worked or did not. Not routine status, raw logs or secrets.",
                       "- Before your first record, read the format: `skill_view(\"post-cortex:memory\")`."]
+        if self._cards_block:
+            lines += ["", self._cards_block]
         return "\n".join(lines)
 
     def _format(self, results: list[dict]) -> tuple[str, int]:
@@ -351,9 +423,40 @@ class PostCortexMemoryProvider(MemoryProvider):
             self._client.write(self._session_id, "concept_defined",
                                {"title": text.splitlines()[0][:120], "description": text[:4000],
                                 "source": f"hermes built-in {target} memory ({action})"},
-                               entities, relations)
+                               entities, relations, author=self._session_name)
         except (PcxError, OSError, ValueError) as e:
             logger.warning("post-cortex: mirroring a %s memory write failed: %s", target, e)
+
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "",
+                  messages: Optional[list[dict[str, Any]]] = None,
+                  turn_author: Optional[dict[str, Any]] = None) -> None:
+        """With "capture": the user's message and the reply go to the message stream. Turn ids
+        are "<hermes session>:<n>:user|assistant" (n = user messages so far), so a resent turn
+        is skipped by the daemon. Tool names and file paths of the turn go with the reply;
+        tool output never does."""
+        if not self._client or not self._writes or not self._cfg["capture"]:
+            return
+        user_text = (user_content or "").strip()
+        reply = (assistant_content or "").strip()
+        if not user_text and not reply:
+            return
+        key = session_id or "default"
+        n = turn_number(messages) or self._turns.get(key, 0) + 1
+        self._turns[key] = n
+        tools, files = turn_tools(messages)
+        who = (turn_author or {}).get("name") if isinstance(turn_author, dict) else None
+        captured = []
+        if user_text:
+            captured.append({"turn_id": f"{key}:{n}:user", "role": "user", "text": user_text,
+                             "source_session": key, **({"author": str(who)} if who else {})})
+        if reply:
+            captured.append({"turn_id": f"{key}:{n}:assistant", "role": "assistant", "text": reply,
+                             "author": self._session_name, "source_session": key,
+                             "tools": tools, "files": files})
+        try:
+            self._client.append_messages(self._session_id, captured, timeout=float(self._cfg["capture_timeout_s"]))
+        except (PcxError, OSError, ValueError) as e:
+            logger.warning("post-cortex: capturing turn %s failed: %s", n, e)
 
     # ---- tools ---------------------------------------------------------------------------
 
@@ -384,12 +487,16 @@ class PostCortexMemoryProvider(MemoryProvider):
         scope_id = {"workspace": self._workspace_id, "session": self._session_id}.get(scope, "")
         limit = max(1, min(20, int(args.get("limit") or 8)))
         types = [t for t in (args.get("interaction_type") or []) if t in INTERACTION_TYPES]
+        corpus = args.get("corpus") or None
+        if corpus not in (None, "records", "messages", "all"):
+            return _tool_error("corpus must be records, messages or all")
         results = self._client.search(query, scope=scope, scope_id=scope_id, limit=limit,
                                       recency_bias=args.get("recency_bias"), interaction_type=types or None,
-                                      date_from=args.get("date_from"), date_to=args.get("date_to"))
+                                      date_from=args.get("date_from"), date_to=args.get("date_to"), corpus=corpus)
         out = [{"score": round(float(r.get("combined_score") or 0.0), 3), "type": r.get("content_type"),
                 "session": self._session_names.get(r.get("session_id", ""), r.get("session_id")),
-                "timestamp": r.get("timestamp"), "content_id": r.get("content_id"), "text": r.get("text_content")}
+                "timestamp": r.get("timestamp"), "content_id": r.get("content_id"), "text": r.get("text_content"),
+                **{k: r[k] for k in ("author", "derived_from") if r.get(k)}}
                for r in results]
         return json.dumps({"scope": scope, "results": out}, ensure_ascii=False)
 
@@ -410,7 +517,8 @@ class PostCortexMemoryProvider(MemoryProvider):
             if k not in content:
                 content[str(k)] = str(v)
         self._client.write(self._session_id, itype, content, entities, relations,
-                           code_reference=args.get("code_reference") or None)
+                           code_reference=args.get("code_reference") or None, author=self._session_name,
+                           derived_from=[str(d) for d in args.get("derived_from") or []] or None)
         return json.dumps({"stored": True, "session": self._session_name}, ensure_ascii=False)
 
     def _tool_context(self, args: dict) -> str:

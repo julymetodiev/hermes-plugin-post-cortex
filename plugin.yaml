@@ -1,6 +1,6 @@
 name: post-cortex
-version: "0.1.0"
-description: "post-cortex self-hosted memory: typed records in an entity graph with semantic search. Workspace recall before each turn, built-in memory mirrored, tools to search, record and trace dependencies."
+version: "0.2.0"
+description: "post-cortex self-hosted memory: typed records in an entity graph with semantic search. Workspace recall before each turn, built-in memory mirrored, project and user cards in the system prompt, tools to search, record and trace dependencies, optional conversation capture."
 author: Julius ML
 license: MIT
 homepage: https://github.com/julymetodiev/hermes-plugin-post-cortex

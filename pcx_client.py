@@ -185,10 +185,27 @@ class PcxClient:
         return str((d or {}).get("formatted_text") or "") if isinstance(d, dict) else ""
 
     def write(self, session_id: str, interaction_type: str, content: dict, entities: list[dict],
-              relations: list[dict], *, code_reference: Any = None, timeout: Optional[float] = None) -> Any:
+              relations: list[dict], *, code_reference: Any = None, author: str = "",
+              derived_from: Optional[list[str]] = None, timeout: Optional[float] = None) -> Any:
         args: dict[str, Any] = {"session_id": session_id, "interaction_type": interaction_type,
                                 "content": {str(k): str(v) for k, v in content.items()},
                                 "entities": entities, "relations": relations}
         if code_reference:
             args["code_reference"] = code_reference
+        if author:
+            args["author"] = author
+        if derived_from:
+            args["derived_from"] = derived_from
         return self.call_tool("update_conversation_context", args, timeout)
+
+    # ---- REST: message stream and cards (post-cortex 0.5) ----------------------------------
+
+    def append_messages(self, session_id: str, messages: list[dict], timeout: Optional[float] = None) -> dict:
+        """Append conversation turns to the session's message stream; the daemon skips turn ids
+        it already has. Returns {"appended": [...], "skipped": n, "vectorized": n}."""
+        return self._rest("POST", "/api/messages", {"session_id": session_id, "messages": messages},
+                          timeout) or {}
+
+    def cards(self, workspace_id: str, timeout: Optional[float] = None) -> dict:
+        """{"user": card or None, "workspace": card or None}; a card has "version" and "text"."""
+        return self._rest("GET", f"/api/cards?workspace_id={workspace_id}", timeout=timeout) or {}

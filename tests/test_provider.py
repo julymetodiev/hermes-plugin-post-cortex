@@ -117,6 +117,10 @@ def test_search_tool_maps_scope_and_filters(provider, daemon):
     assert out["results"][0]["session"] == "hermes:eq-sentinel"
     json.loads(provider.handle_tool_call("post_cortex_search", {"query": "x", "scope": "global"}))
     assert "scope_id" not in daemon.calls[-1][1]
+    json.loads(provider.handle_tool_call("post_cortex_search", {"query": "x", "corpus": "messages"}))
+    assert daemon.calls[-1][1]["corpus"] == "messages"
+    bad = json.loads(provider.handle_tool_call("post_cortex_search", {"query": "x", "corpus": "chats"}))
+    assert "corpus" in bad["error"]
 
 
 def test_record_tool_validates_and_writes(provider, daemon):
@@ -128,11 +132,12 @@ def test_record_tool_validates_and_writes(provider, daemon):
         "details": {"evidence": "5.0 s"},
         "entities": [{"name": "svc-social", "entity_type": "code_component"}, {"name": "sweep", "entity_type": "problem"}],
         "relations": [{"from_entity": "sweep", "to_entity": "svc-social", "relation_type": "related_to", "context": "c"}],
-        "code_reference": "ops/sweep.sh:10"}))
+        "code_reference": "ops/sweep.sh:10", "derived_from": ["message:4"]}))
     assert ok["stored"] is True
     rec = daemon.records[-1]
     assert rec["session_id"] == provider._session_id and rec["content"]["evidence"] == "5.0 s"
     assert rec["code_reference"] == "ops/sweep.sh:10"
+    assert rec["derived_from"] == ["message:4"]
 
 
 def test_context_tool(provider, daemon):
@@ -161,3 +166,72 @@ def test_save_config_keeps_token_out_of_the_file(tmp_path):
     saved = json.loads((tmp_path / "post-cortex.json").read_text())
     assert saved == {"url": "http://pcx:3737"}
 
+
+
+def _messages(*turns):
+    """OpenAI-style history: (user text, [(tool name, args)], reply) per turn."""
+    out = []
+    for user, calls, reply in turns:
+        out.append({"role": "user", "content": user})
+        if calls:
+            out.append({"role": "assistant", "content": "", "tool_calls": [
+                {"id": f"c{i}", "type": "function",
+                 "function": {"name": name, "arguments": json.dumps(args)}} for i, (name, args) in enumerate(calls)]})
+            out.append({"role": "tool", "content": "tool output, never sent"})
+        out.append({"role": "assistant", "content": reply})
+    return out
+
+
+def test_capture_is_off_by_default(provider, daemon):
+    provider.sync_turn("restart svc-social?", "done", session_id="h1", messages=_messages(("q", [], "a")))
+    assert daemon.messages == []
+
+
+def test_turns_are_captured_with_tools_files_and_authors(daemon, home):
+    (home / "post-cortex.json").write_text(json.dumps({"url": daemon.url, "capture": True}))
+    p = plugin.PostCortexMemoryProvider()
+    p.initialize("s1", hermes_home=str(home), agent_identity="eq-sentinel", agent_context="primary")
+    history = _messages(("first question", [], "first answer"),
+                        ("restart svc-social?", [("terminal", {"command": "systemctl restart x"}),
+                                                 ("read_file", {"path": "/etc/svc.conf"})], "restarted"))
+    p.sync_turn("restart svc-social?", "restarted", session_id="h1", messages=history,
+                turn_author={"id": "42", "name": "Julius", "is_bot": False})
+    user, reply = daemon.messages
+    assert user["turn_id"] == "h1:2:user" and user["author"] == "Julius" and user["role"] == "user"
+    assert reply["turn_id"] == "h1:2:assistant" and reply["author"] == "hermes:eq-sentinel"
+    assert reply["tools"] == ["terminal", "read_file"] and reply["files"] == ["/etc/svc.conf"]
+    assert "tool output" not in json.dumps(daemon.messages)
+    assert {m["session_id"] for m in daemon.messages} == {p._session_id}
+    # A resent turn is skipped by the daemon (same turn ids).
+    p.sync_turn("restart svc-social?", "restarted", session_id="h1", messages=history)
+    assert len(daemon.messages) == 2
+
+
+def test_subagent_does_not_capture(daemon, home):
+    (home / "post-cortex.json").write_text(json.dumps({"url": daemon.url, "capture": True}))
+    p = plugin.PostCortexMemoryProvider()
+    p.initialize("s1", hermes_home=str(home), agent_identity="eq-sentinel", agent_context="subagent")
+    p.sync_turn("q", "a", session_id="h1")
+    assert daemon.messages == []
+
+
+def test_records_carry_the_profile_as_author(provider, daemon):
+    provider.on_memory_write("add", "memory", "svc-social restarts are safe at night")
+    assert daemon.records[-1]["author"] == "hermes:eq-sentinel"
+
+
+def test_cards_go_into_the_system_prompt(daemon, home):
+    daemon.cards = {"user": {"version": 1, "text": "Answer briefly."},
+                    "workspace": {"version": 3, "text": "## Goals\nship"}}
+    p = plugin.PostCortexMemoryProvider()
+    p.initialize("s1", hermes_home=str(home), agent_identity="eq-sentinel")
+    block = p.system_prompt_block()
+    assert "### User card\nAnswer briefly." in block
+    assert "### Project card (Equal)\n## Goals\nship" in block
+
+
+def test_daemon_without_cards_api_still_works(daemon, home):
+    daemon.cards_api = False
+    p = plugin.PostCortexMemoryProvider()
+    p.initialize("s1", hermes_home=str(home), agent_identity="eq-sentinel")
+    assert p._client is not None and "card" not in p.system_prompt_block().lower()

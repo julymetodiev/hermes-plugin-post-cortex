@@ -20,16 +20,26 @@ What the plugin does:
   stored as a record (primary agent only; cron and subagent runs never write automatically).
 - **Tools:** `post_cortex_search`, `post_cortex_record`, `post_cortex_context` (graph
   neighbourhood and reverse dependencies of named components).
+- **Cards** (post-cortex 0.5): the user card and the workspace's project card, short notes
+  with preferences, stack, conventions and current goals, are put in the system prompt.
+- **Authorship:** records and messages carry the author `hermes:<profile>`, so other clients
+  see who wrote what and can search one author's records.
+- **Conversation capture** (opt-in, post-cortex 0.5): with `"capture": true` each completed
+  turn goes to the profile session's message stream, kept apart from the records and
+  searched only when asked for (`sources: messages`).
 - **Skill:** `post-cortex:memory`, the record format and search tips, loaded with
   `skill_view("post-cortex:memory")`.
 
-No conversation turns are captured automatically: whole turns are noise. Agents record
-durable knowledge deliberately.
+Without `capture`, no conversation turns are stored: agents record durable knowledge
+deliberately. Capture keeps the conversation itself as well, for things said but never
+recorded; the daemon keeps captured turns for a limited time (`message_retention_days`,
+90 by default).
 
 ## Requirements
 
 - Hermes Agent 0.22.2 or newer.
-- A post-cortex daemon, **0.4.0 or newer**, reachable over HTTP (`pcx start`). No Python
+- A post-cortex daemon, **0.4.0 or newer**, reachable over HTTP (`pcx start`); cards,
+  authorship and capture need **0.5.0** (older daemons simply go without them). No Python
   dependencies beyond the standard library.
 
 ## Install
@@ -79,6 +89,9 @@ Optional settings live in `$HERMES_HOME/post-cortex.json` (per profile). Everyth
   "timeout_s": 3.0,
   "mirror_memory_writes": true,
   "tools": true,
+  "cards": true,
+  "capture": false,
+  "capture_timeout_s": 15.0,
   "skip_patterns": ["^Modified /", "^Incremental Update\\s*$"],
   "entity_patterns": [
     {"pattern": "\\b[a-z]+-api\\b", "entity_type": "code_component"}
@@ -94,6 +107,9 @@ Optional settings live in `$HERMES_HOME/post-cortex.json` (per profile). Everyth
 | `max_items`, `item_chars` | Size of the injected recall block. |
 | `timeout_s` | Per request. Recall is skipped, not retried, when the daemon is slow or down. |
 | `tools` | `false` to drop the three tools (for example when the post-cortex MCP server is configured in Hermes directly). |
+| `cards` | `false` to leave the user and project cards out of the system prompt. |
+| `capture` | `true` to send each completed turn (the user's message, the final reply, the names of the tools used and the file paths they touched; never tool output) to the message stream. Primary agent only. |
+| `capture_timeout_s` | Per capture request; capture runs on Hermes' background sync worker. |
 | `skip_patterns` | Regexes for records that carry no knowledge; they are never injected. |
 | `entity_patterns` | Regexes that name entities in mirrored memory notes, so they join the graph. |
 
@@ -116,13 +132,18 @@ mcp_servers:
 
 - **Where data goes.** Only to the post-cortex daemon at the configured URL. Each non-trivial
   user prompt (up to 2,000 characters) is sent as a search query before the turn. Built-in
-  memory writes and `post_cortex_record` calls are sent as records. Nothing is sent anywhere else.
-- **What is stored.** The daemon stores records, entities and relations in its own database. The
-  daemon redacts credentials, e-mail addresses, phone numbers and public IPv4 addresses on write.
+  memory writes and `post_cortex_record` calls are sent as records. With `capture` on (off by
+  default), each completed turn is sent as well: the user's message (with the sender's display
+  name when Hermes knows it), the final reply, tool names and file paths; tool output is never
+  sent. Nothing is sent anywhere else.
+- **What is stored.** The daemon stores records, entities and relations (and, with `capture`,
+  the turns, deleted after `message_retention_days`) in its own database. The daemon redacts
+  credentials, e-mail addresses, phone numbers and public IPv4 addresses on write.
 - **Credentials.** `PCX_TOKEN` is read through the Hermes secret scope and never written to
   `post-cortex.json`.
 - **State on this machine.** Only `$HERMES_HOME/post-cortex.json`. The plugin starts no
-  background threads or processes and never deletes data in post-cortex.
+  threads or processes of its own (capture runs on Hermes' sync worker) and never deletes data
+  in post-cortex.
 
 ## Development
 

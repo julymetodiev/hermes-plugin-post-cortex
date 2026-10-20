@@ -81,6 +81,10 @@ class FakeDaemon:
         self.calls: list[tuple[str, dict]] = []
         self.mcp_sessions: set[str] = set()
         self.priming = True
+        self.messages: list[dict] = []
+        self.turn_ids: set[tuple[str, str]] = set()
+        self.cards: dict = {"user": None, "workspace": None}
+        self.cards_api = True
         daemon = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -117,6 +121,8 @@ class FakeDaemon:
                 if self.path == "/api/sessions":
                     return self._json([{"id": s["id"], "name": s["name"], "workspace": s.get("workspace")}
                                        for s in daemon.sessions.values()])
+                if self.path.startswith("/api/cards") and daemon.cards_api:
+                    return self._json(daemon.cards)
                 self._send(404)
 
             def do_POST(self):
@@ -137,6 +143,17 @@ class FakeDaemon:
                     return self._json({"ok": True})
                 if self.path == "/mcp":
                     return self._mcp(body)
+                if self.path == "/api/messages":
+                    appended, skipped = [], 0
+                    for m in body["messages"]:
+                        key = (body["session_id"], m["turn_id"])
+                        if key in daemon.turn_ids:
+                            skipped += 1
+                            continue
+                        daemon.turn_ids.add(key)
+                        daemon.messages.append({"session_id": body["session_id"], **m})
+                        appended.append(len(daemon.messages) - 1)
+                    return self._json({"appended": appended, "skipped": skipped, "vectorized": len(appended)})
                 self._send(404)
 
             def _mcp(self, msg):
